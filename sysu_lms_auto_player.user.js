@@ -1,8 +1,8 @@
-// ==UserScript==
-// @name         中山大学 LMS 视频自动播放器
+﻿// ==UserScript==
+// @name         中山大学 LMS 自动学习助手
 // @namespace    https://lms.sysu.edu.cn/
-// @version      1.3.0
-// @description  自动播放课程视频，并按活动顺序跳转（章节小测优先，期末默认停下）
+// @version      1.3.1
+// @description  自动播放课程视频并按活动顺序跳转（章节小测优先，期末默认停下）
 // @author       You
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
 // @match        https://lms.sysu.edu.cn/mod/quiz/review.php*
@@ -56,7 +56,7 @@
 
     function normalizeActivityTitle(title) {
         return String(title || '')
-            .replace(/[◄►]/g, '')
+            .replace(/[◆▶►▸]/g, '')
             .replace(/\s+/g, ' ')
             .trim();
     }
@@ -182,7 +182,7 @@
     }
 
     function showDoneNotice(message = '当前课程活动已到末尾。') {
-        updateStatus(`🎉 ${escapeHtml(message)}`);
+        updateStatus(`已完成： ${escapeHtml(message)}`);
         const ui = document.getElementById('lms-auto-player-ui');
         if (ui) ui.style.background = 'rgba(52,168,83,0.95)';
     }
@@ -433,23 +433,23 @@
             });
             if (!nextActivity || isSameActivityByIdOrPath(nextActivity, current)) {
                 log('self-loop-blocked: 降级重算后仍是当前页，停止自动跳转', 'error');
-                updateStatus('⚠️ 检测到重复跳转风险，已停止自动跳转，请手动进入下一活动。');
+                updateStatus('检测到重复跳转风险，已停止自动跳转，请手动进入下一活动。');
                 return;
             }
         }
 
         if (CONFIG.stopBeforeFinalExam && nextActivity.isFinal) {
             log('检测到下一活动为期末考试，按配置停止自动跳转', 'warn');
-            updateStatus('🛑 已到期末考试，按配置停止自动跳转，请手动开始。');
+            updateStatus('已到期末考试，按配置停止自动跳转，请手动开始。');
             return;
         }
 
         if (isJumpLoopBlocked(current, nextActivity)) {
             log(
-                `self-loop-blocked: 1分钟内重复跳转到同一目标过多次 -> ${nextActivity.title || nextActivity.url}`,
+                `self-loop-blocked: 1分钟内重复跳到同一目标过多次 -> ${nextActivity.title || nextActivity.url}`,
                 'error'
             );
-            updateStatus('⚠️ 检测到短时重复跳转循环，已暂停自动跳转，请手动检查。');
+            updateStatus('检测到短时重复跳转循环，已暂停自动跳转，请手动检查。');
             return;
         }
 
@@ -458,7 +458,7 @@
             `${CONFIG.nextPageDelay}ms 后跳转到下一活动 [${nextActivity.source || 'unknown'}]：${nextActivity.title || nextActivity.url}`,
             'success'
         );
-        updateStatus(`✅ 即将跳转到下一活动：${target}`);
+        updateStatus(`即将跳转到下一活动：${target}`);
 
         setTimeout(() => {
             window.location.href = nextActivity.url;
@@ -511,22 +511,74 @@
         log(`倍速已设置为 ${CONFIG.playbackRate}x`);
     }
 
-    function isAlreadyCompleted() {
+    function getWatchProgressPercent() {
         const progressEl = document.querySelector('.num-bfjd span');
-        if (!progressEl) return false;
+        if (!progressEl) return null;
 
-        const progress = parseInt(progressEl.textContent, 10);
-        log(`当前播放进度：${progress}%`);
-        return progress >= 100;
+        const raw = String(progressEl.textContent || '').trim();
+        if (!raw) return null;
+
+        const value = Number.parseFloat(raw.replace('%', '').replace(/[^\d.]/g, ''));
+        return Number.isFinite(value) ? value : null;
+    }
+
+    function isWatchProgressComplete(progress = getWatchProgressPercent()) {
+        return Number.isFinite(progress) && progress >= 100;
+    }
+
+    async function waitForProgressSyncAfterEnded(maxWaitMs = 5000, intervalMs = 500) {
+        const startAt = Date.now();
+        let latestProgress = getWatchProgressPercent();
+
+        while (Date.now() - startAt < maxWaitMs) {
+            if (isWatchProgressComplete(latestProgress)) {
+                return latestProgress;
+            }
+
+            await sleep(intervalMs);
+            const next = getWatchProgressPercent();
+            if (Number.isFinite(next)) {
+                latestProgress = next;
+            }
+        }
+
+        return latestProgress;
+    }
+
+    function restartCurrentVideo(video, reason = 'progress-incomplete') {
+        const progress = getWatchProgressPercent();
+        const safeProgress = Number.isFinite(progress) ? progress.toFixed(1) : 'N/A';
+
+        log(`Watch progress ${safeProgress}% is not complete (${reason}), restart current video`, 'warn');
+        updateStatus(`进度 ${safeProgress}% < 100%，自动重播当前视频...`);
+
+        try {
+            video.currentTime = 0;
+        } catch (error) {
+            log(`Reset currentTime failed: ${error.message}`, 'warn');
+        }
+
+        tryPlay(video);
+    }
+
+    function isAlreadyCompleted() {
+        const progress = getWatchProgressPercent();
+        if (!Number.isFinite(progress)) {
+            log('未读取到观看进度，按未完成处理', 'warn');
+            return false;
+        }
+
+        log(`当前播放进度：${progress.toFixed(1)}%`);
+        return isWatchProgressComplete(progress);
     }
 
     async function runFsresourcePage() {
         let retryCount = 0;
-        updateStatus('⏳ 正在初始化视频自动播放...');
+        updateStatus('正在初始化视频自动播放...');
 
         if (CONFIG.skipCompleted && isAlreadyCompleted()) {
-            log('此视频已完成（100%），直接跳到下一活动', 'success');
-            updateStatus('✅ 此视频已完成，准备跳到下一活动...');
+            log('当前视频观看进度已达 100%，直接进入下一活动', 'success');
+            updateStatus('当前视频已完成，准备跳转下一活动...');
             goToNextActivity();
             return;
         }
@@ -534,61 +586,127 @@
         let video;
         while (retryCount < CONFIG.maxRetries) {
             try {
-                updateStatus('⏳ 等待播放器加载...');
+                updateStatus('等待播放器加载...');
                 video = await waitForVideo();
-                log('视频元素已找到', 'success');
+                log('已找到视频元素', 'success');
                 break;
             } catch (e) {
                 retryCount++;
                 log(`第 ${retryCount} 次重试（${e.message}）`, 'warn');
-                updateStatus(`⚠️ 加载超时，第 ${retryCount} 次重试...`);
+                updateStatus(`加载超时，正在第 ${retryCount} 次重试...`);
                 if (retryCount >= CONFIG.maxRetries) {
-                    log('已超过最大重试次数，请手动刷新页面', 'error');
-                    updateStatus('❌ 加载失败，请手动刷新页面');
+                    log('超过最大重试次数，请手动刷新页面', 'error');
+                    updateStatus('加载失败，请手动刷新页面');
                     return;
                 }
                 await sleep(CONFIG.retryDelay);
             }
         }
 
-        updateStatus('▶️ 正在尝试播放...');
+        updateStatus('正在尝试播放视频...');
         tryPlay(video);
+
+        let hasNavigated = false;
+        let progressWatcher = null;
+        let stuckChecker = null;
+
+        const clearRuntimeTimers = () => {
+            if (progressWatcher) {
+                clearInterval(progressWatcher);
+                progressWatcher = null;
+            }
+            if (stuckChecker) {
+                clearInterval(stuckChecker);
+                stuckChecker = null;
+            }
+        };
+
+        const tryGoNextWhenProgressComplete = (trigger, progress = getWatchProgressPercent()) => {
+            const safeProgress = Number.isFinite(progress) ? progress.toFixed(1) : 'N/A';
+
+            if (!isWatchProgressComplete(progress)) return false;
+            if (hasNavigated) {
+                log(`已触发跳转，忽略重复请求（${trigger}）`, 'info');
+                return true;
+            }
+
+            hasNavigated = true;
+            clearRuntimeTimers();
+            log(`观看进度已达 ${safeProgress}%（${trigger}），立即跳转下一活动`, 'success');
+            updateStatus('观看进度达到 100%，即将跳转下一活动...');
+            goToNextActivity();
+            return true;
+        };
+
+        progressWatcher = setInterval(() => {
+            const progress = getWatchProgressPercent();
+            if (!Number.isFinite(progress)) return;
+            if (isWatchProgressComplete(progress)) {
+                tryGoNextWhenProgressComplete('progress-watcher', progress);
+            }
+        }, 1000);
+
+        window.addEventListener(
+            'pagehide',
+            () => {
+                clearRuntimeTimers();
+            },
+            { once: true }
+        );
 
         video.addEventListener('playing', () => {
             log('视频开始播放', 'success');
-            const title = document.title.replace(' | 中山大学在线教学平台', '').trim();
-            updateStatus(`▶️ 正在播放：${escapeHtml(title)}<br>⏱ 倍速：${CONFIG.playbackRate}x`);
+            const title = document.title.replace(/\s*\|\s*中山大学在线教学平台\s*$/, '').trim() || '当前视频';
+            updateStatus(`正在播放：${escapeHtml(title)}<br>倍速：${CONFIG.playbackRate}x`);
         });
 
         video.addEventListener('pause', () => {
             if (!video.ended) {
                 log('视频意外暂停，尝试自动恢复', 'warn');
-                updateStatus('⚠️ 视频暂停，尝试恢复...');
+                updateStatus('视频暂停，正在尝试恢复播放...');
                 setTimeout(() => {
-                    if (video.paused && !video.ended) video.play();
+                    if (video.paused && !video.ended) {
+                        video.play().catch(() => {});
+                    }
                 }, 1000);
             }
         });
 
         video.addEventListener('error', () => {
             log(`视频播放错误：code=${video.error?.code}`, 'error');
-            updateStatus('❌ 播放出错，请检查网络或刷新页面');
+            updateStatus('视频播放出错，请检查网络或刷新页面');
         });
 
         video.addEventListener('waiting', () => {
             log('视频缓冲中', 'warn');
-            updateStatus('⏳ 缓冲中，请稍候...');
+            updateStatus('视频缓冲中，请稍候...');
         });
 
-        video.addEventListener('ended', () => {
-            log('视频播放完毕，准备跳到下一活动', 'success');
-            updateStatus('✅ 视频已播完，准备跳到下一活动...');
-            goToNextActivity();
+        video.addEventListener('ended', async () => {
+            if (video.__lmsHandlingEnded) return;
+            video.__lmsHandlingEnded = true;
+
+            try {
+                log('视频播放结束，正在校验观看进度', 'info');
+                updateStatus('视频结束，正在同步观看进度...');
+
+                const syncedProgress = await waitForProgressSyncAfterEnded();
+                const safeProgress = Number.isFinite(syncedProgress) ? syncedProgress.toFixed(1) : 'N/A';
+
+                if (tryGoNextWhenProgressComplete('ended-sync', syncedProgress)) {
+                    return;
+                }
+
+                log(`观看进度仅 ${safeProgress}%，未到 100%，重播当前视频`, 'warn');
+                restartCurrentVideo(video, 'progress-not-complete-after-ended');
+            } finally {
+                video.__lmsHandlingEnded = false;
+            }
         });
 
         let lastTime = -1;
         let stuckCount = 0;
-        const stuckChecker = setInterval(() => {
+        stuckChecker = setInterval(() => {
             if (video.ended) {
                 clearInterval(stuckChecker);
                 return;
@@ -599,10 +717,30 @@
                     stuckCount++;
                     log(`视频可能卡住（${stuckCount}/3），currentTime=${video.currentTime}`, 'warn');
                     if (stuckCount >= 3) {
-                        clearInterval(stuckChecker);
-                        log('视频卡住超过 90 秒，跳到下一活动', 'error');
-                        updateStatus('⚠️ 视频长时间无进度，跳到下一活动...');
-                        goToNextActivity();
+                        const progress = getWatchProgressPercent();
+                        const safeProgress = Number.isFinite(progress) ? progress.toFixed(1) : 'N/A';
+
+                        if (tryGoNextWhenProgressComplete('stuck-checker', progress)) {
+                            return;
+                        }
+
+                        log(`视频卡住且进度 ${safeProgress}% < 100%，尝试恢复/重播当前视频`, 'warn');
+                        updateStatus(`视频长时间无进度（当前 ${safeProgress}%），尝试恢复播放...`);
+
+                        try {
+                            if (video.paused) {
+                                tryPlay(video);
+                            } else {
+                                video.play().catch(() => {});
+                            }
+                        } catch {
+                            // ignore and fallback to restart
+                        }
+
+                        if (video.currentTime === lastTime) {
+                            restartCurrentVideo(video, 'stuck-with-incomplete-progress');
+                        }
+                        stuckCount = 0;
                     }
                 } else {
                     stuckCount = 0;
@@ -613,19 +751,18 @@
     }
 
     // ============================================================
-    // 小测回顾页逻辑（mod/quiz/review.php）
-    // ============================================================
+    // 小测回顾页逻辑（mod/quiz/review.php）    // ============================================================
     function runQuizReviewPage() {
-        updateStatus('🧾 已进入小测回顾页');
+        updateStatus('已进入小测回顾页');
         log('检测到 quiz/review 页面');
 
         if (!CONFIG.autoContinueFromQuizReview) {
             log('配置关闭：小测回顾页不自动继续', 'warn');
-            updateStatus('⏸ 已到小测回顾页，请手动进入下一活动。');
+            updateStatus('已到小测回顾页，请手动进入下一活动。');
             return;
         }
 
-        updateStatus('✅ 小测已提交，准备进入下一活动...');
+        updateStatus('小测已提交，准备进入下一活动...');
         goToNextActivity();
     }
 
@@ -655,3 +792,5 @@
         window.addEventListener('load', main);
     }
 })();
+
+
