@@ -1,11 +1,12 @@
 ﻿// ==UserScript==
 // @name         中山大学 LMS 自动学习助手
 // @namespace    https://lms.sysu.edu.cn/
-// @version      1.3.1
-// @description  自动播放课程视频并按活动顺序跳转（章节小测优先，期末默认停下）
+// @version      1.3.2
+// @description  支持国家安全/心理健康模式切换的 LMS 自动学习助手
 // @author       You
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
 // @match        https://lms.sysu.edu.cn/mod/quiz/review.php*
+// @match        https://lms.sysu.edu.cn/mod/forum/view.php*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -30,6 +31,12 @@
     };
 
     const LOOP_GUARD_KEY = 'lms-auto-player-loop-guard-v1';
+    const MODE_STORAGE_KEY = 'lms-auto-player-mode-v1';
+    const MODES = {
+        NATIONAL_SECURITY: 'national-security',
+        MENTAL_HEALTH: 'mental-health',
+    };
+    const DEFAULT_MODE = MODES.NATIONAL_SECURITY;
 
     // ============================================================
     // 日志与基础工具
@@ -53,6 +60,33 @@
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
+
+    function normalizeMode(mode) {
+        return Object.values(MODES).includes(mode) ? mode : DEFAULT_MODE;
+    }
+
+    function getCurrentMode() {
+        try {
+            const storedMode = localStorage.getItem(MODE_STORAGE_KEY);
+            return normalizeMode(storedMode || DEFAULT_MODE);
+        } catch {
+            return DEFAULT_MODE;
+        }
+    }
+
+    function setCurrentMode(mode) {
+        const normalizedMode = normalizeMode(mode);
+        try {
+            localStorage.setItem(MODE_STORAGE_KEY, normalizedMode);
+        } catch {
+            // ignore
+        }
+        return normalizedMode;
+    }
+
+    function getModeLabel(mode) {
+        return mode === MODES.MENTAL_HEALTH ? '心理健康' : '国家安全';
+    }
 
     function normalizeActivityTitle(title) {
         return String(title || '')
@@ -175,10 +209,41 @@
 
     function updateStatus(msg) {
         const ui = createStatusUI();
+        const currentMode = getCurrentMode();
+        const modeSummary =
+            currentMode === MODES.MENTAL_HEALTH ? '心理健康（forum 自动跳过）' : '国家安全（forum 不接管）';
+
         ui.innerHTML = `
             <div style="font-weight:bold;margin-bottom:4px;">LMS 自动学习助手</div>
+            <div style="margin-bottom:8px;">
+                <label for="lms-auto-player-mode-select" style="display:block;font-size:12px;opacity:0.9;">学习模式</label>
+                <select id="lms-auto-player-mode-select" style="width:100%;margin-top:2px;padding:3px 6px;border-radius:6px;border:none;">
+                    <option value="${MODES.NATIONAL_SECURITY}" ${
+            currentMode === MODES.NATIONAL_SECURITY ? 'selected' : ''
+        }>国家安全</option>
+                    <option value="${MODES.MENTAL_HEALTH}" ${
+            currentMode === MODES.MENTAL_HEALTH ? 'selected' : ''
+        }>心理健康</option>
+                </select>
+                <div style="font-size:11px;opacity:0.85;margin-top:3px;">当前：${modeSummary}</div>
+            </div>
             <div>${msg}</div>
         `;
+
+        const modeSelect = ui.querySelector('#lms-auto-player-mode-select');
+        if (modeSelect && !modeSelect.dataset.bound) {
+            modeSelect.dataset.bound = '1';
+            modeSelect.addEventListener('change', (event) => {
+                const selectedMode = setCurrentMode(event.target.value);
+                const modeLabel = getModeLabel(selectedMode);
+                const modeTip =
+                    selectedMode === MODES.MENTAL_HEALTH
+                        ? '（forum 页面将自动跳过）'
+                        : '（forum 页面不自动跳转）';
+                log(`模式已切换为：${modeLabel}`, 'info');
+                updateStatus(`模式已切换为：${modeLabel}${modeTip}`);
+            });
+        }
     }
 
     function showDoneNotice(message = '当前课程活动已到末尾。') {
@@ -463,6 +528,21 @@
         setTimeout(() => {
             window.location.href = nextActivity.url;
         }, CONFIG.nextPageDelay);
+    }
+
+    function hasNextActivityEntrances() {
+        const nextLink = document.querySelector('#next-activity-link');
+        const select = document.querySelector('#jump-to-activity, select[name="jump"], .fsresource-nav select');
+        return Boolean((nextLink && nextLink.href) || select);
+    }
+
+    async function waitForNextActivityEntrances(maxWaitMs = 6000, intervalMs = 300) {
+        const startAt = Date.now();
+        while (Date.now() - startAt < maxWaitMs) {
+            if (hasNextActivityEntrances()) return true;
+            await sleep(intervalMs);
+        }
+        return false;
     }
 
     // ============================================================
@@ -751,7 +831,8 @@
     }
 
     // ============================================================
-    // 小测回顾页逻辑（mod/quiz/review.php）    // ============================================================
+    // 小测回顾页逻辑（mod/quiz/review.php）
+    // ============================================================
     function runQuizReviewPage() {
         updateStatus('已进入小测回顾页');
         log('检测到 quiz/review 页面');
@@ -767,11 +848,35 @@
     }
 
     // ============================================================
+    // Forum 页逻辑（mod/forum/view.php）
+    // ============================================================
+    async function runForumPage() {
+        const currentMode = getCurrentMode();
+        const modeLabel = getModeLabel(currentMode);
+
+        if (currentMode !== MODES.MENTAL_HEALTH) {
+            log(`检测到 forum 页面，当前模式为 ${modeLabel}，不自动跳转`, 'info');
+            updateStatus(`当前模式：${modeLabel}。Forum 页面不自动跳转。`);
+            return;
+        }
+
+        log('检测到 forum 页面，心理健康模式：准备自动进入下一活动', 'info');
+        updateStatus('心理健康模式：检测到讨论/公告页面，准备自动进入下一活动...');
+
+        const entrancesReady = await waitForNextActivityEntrances();
+        if (!entrancesReady) {
+            log('forum 页面等待下一活动入口超时，尝试直接解析并跳转', 'warn');
+        }
+        goToNextActivity();
+    }
+
+    // ============================================================
     // 启动入口
     // ============================================================
     function main() {
         const pathname = window.location.pathname.toLowerCase();
-        log(`脚本启动，当前页面：${window.location.href}`);
+        const modeLabel = getModeLabel(getCurrentMode());
+        log(`脚本启动，当前页面：${window.location.href}，当前模式：${modeLabel}`);
 
         if (pathname.includes('/mod/fsresource/view.php')) {
             runFsresourcePage();
@@ -780,6 +885,11 @@
 
         if (pathname.includes('/mod/quiz/review.php')) {
             runQuizReviewPage();
+            return;
+        }
+
+        if (pathname.includes('/mod/forum/view.php')) {
+            runForumPage();
             return;
         }
 
